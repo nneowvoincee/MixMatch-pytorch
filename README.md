@@ -1,4 +1,10 @@
+
+
 # MixMatch
+This is fork of [MixMatch-pytorch](https://github.com/YU1ut/MixMatch-pytorch) for Python 3.11.
+
+It now supports the `K` hyperparameter for augmenting unlabeled data with `--K [times]`.
+
 This is an unofficial PyTorch implementation of [MixMatch: A Holistic Approach to Semi-Supervised Learning](https://arxiv.org/abs/1905.02249). 
 The official Tensorflow implementation is [here](https://github.com/google-research/mixmatch).
 
@@ -8,9 +14,9 @@ This repository carefully implemented important details of the official implemen
 
 
 ## Requirements
-- Python 3.6+
-- PyTorch 1.0
-- **torchvision 0.2.2 (older versions are not compatible with this code)** 
+- Python 3.11+
+- PyTorch 2.3.1
+- **torchvision 0.18.1 (older versions are not compatible with this code)** 
 - tensorboardX
 - progress
 - matplotlib
@@ -53,3 +59,4 @@ tensorboard.sh --port 6006 --logdir cifar10@250
   year={2019}
 }
 ```
+****

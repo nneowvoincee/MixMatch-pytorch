@@ -4,10 +4,10 @@ import argparse
 import os
 import shutil
 import time
+import datetime
 import random
 
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.parallel
@@ -40,6 +40,8 @@ parser.add_argument('--manualSeed', type=int, default=0, help='manual seed')
 #Device options
 parser.add_argument('--gpu', default='0', type=str,
                     help='id(s) for CUDA_VISIBLE_DEVICES')
+parser.add_argument('--dataset-root', default='./data', type=str)
+
 #Method options
 parser.add_argument('--n-labeled', type=int, default=250,
                         help='Number of labeled data')
@@ -50,6 +52,7 @@ parser.add_argument('--out', default='result',
 parser.add_argument('--alpha', default=0.75, type=float)
 parser.add_argument('--lambda-u', default=75, type=float)
 parser.add_argument('--T', default=0.5, type=float)
+parser.add_argument('--K', default=2, type=int)
 parser.add_argument('--ema-decay', default=0.999, type=float)
 
 
@@ -58,6 +61,7 @@ state = {k: v for k, v in args._get_kwargs()}
 
 # Use CUDA
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+torch.cuda.device_count.cache_clear()
 use_cuda = torch.cuda.is_available()
 
 # Random seed
@@ -85,7 +89,7 @@ def main():
         dataset.ToTensor(),
     ])
 
-    train_labeled_set, train_unlabeled_set, val_set, test_set = dataset.get_cifar10('./data', args.n_labeled, transform_train=transform_train, transform_val=transform_val)
+    train_labeled_set, train_unlabeled_set, val_set, test_set = dataset.get_cifar10(args.dataset_root, args.n_labeled, transform_train=transform_train, transform_val=transform_val)
     labeled_trainloader = data.DataLoader(train_labeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     unlabeled_trainloader = data.DataLoader(train_unlabeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     val_loader = data.DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
@@ -138,12 +142,14 @@ def main():
     writer = SummaryWriter(args.out)
     step = 0
     test_accs = []
+
+    start = time.time()
     # Train and val
     for epoch in range(start_epoch, args.epochs):
 
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
 
-        train_loss, train_loss_x, train_loss_u = train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, train_criterion, epoch, use_cuda)
+        train_loss, train_loss_x, train_loss_u = train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, train_criterion, epoch, use_cuda, args.K)
         _, train_acc = validate(labeled_trainloader, ema_model, criterion, epoch, use_cuda, mode='Train Stats')
         val_loss, val_acc = validate(val_loader, ema_model, criterion, epoch, use_cuda, mode='Valid Stats')
         test_loss, test_acc = validate(test_loader, ema_model, criterion, epoch, use_cuda, mode='Test Stats ')
@@ -182,8 +188,11 @@ def main():
     print('Mean acc:')
     print(np.mean(test_accs[-20:]))
 
+    print('total time:')
+    print(datetime.timedelta(seconds=(time.time() - start)))
 
-def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, criterion, epoch, use_cuda):
+
+def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, criterion, epoch, use_cuda, k):
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -200,16 +209,16 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
     model.train()
     for batch_idx in range(args.train_iteration):
         try:
-            inputs_x, targets_x = labeled_train_iter.next()
+            inputs_x, targets_x = next(labeled_train_iter)
         except:
             labeled_train_iter = iter(labeled_trainloader)
-            inputs_x, targets_x = labeled_train_iter.next()
+            inputs_x, targets_x = next(labeled_train_iter)
 
         try:
-            (inputs_u, inputs_u2), _ = unlabeled_train_iter.next()
+            inputs_k_u, _ = next(unlabeled_train_iter)
         except:
             unlabeled_train_iter = iter(unlabeled_trainloader)
-            (inputs_u, inputs_u2), _ = unlabeled_train_iter.next()
+            inputs_k_u, _ = next(unlabeled_train_iter)
 
         # measure data loading time
         data_time.update(time.time() - end)
@@ -221,22 +230,24 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
 
         if use_cuda:
             inputs_x, targets_x = inputs_x.cuda(), targets_x.cuda(non_blocking=True)
-            inputs_u = inputs_u.cuda()
-            inputs_u2 = inputs_u2.cuda()
+            inputs_k_u = [inputs_u.cuda() for inputs_u in inputs_k_u]
 
 
         with torch.no_grad():
             # compute guessed labels of unlabel samples
-            outputs_u = model(inputs_u)
-            outputs_u2 = model(inputs_u2)
-            p = (torch.softmax(outputs_u, dim=1) + torch.softmax(outputs_u2, dim=1)) / 2
-            pt = p**(1/args.T)
+            outputs_k_u = torch.stack([model(inputs_u) for inputs_u in inputs_k_u]) # [k, batch, classes]
+
+            # sharpened
+            p = torch.softmax(outputs_k_u, dim=2)
+            p = torch.mean(p, dim=0)
+
+            pt = p**(1/args.T)  # [batch, classes]
             targets_u = pt / pt.sum(dim=1, keepdim=True)
             targets_u = targets_u.detach()
 
         # mixup
-        all_inputs = torch.cat([inputs_x, inputs_u, inputs_u2], dim=0)
-        all_targets = torch.cat([targets_x, targets_u, targets_u], dim=0)
+        all_inputs = torch.cat([inputs_x, *inputs_k_u], dim=0)
+        all_targets = torch.cat([targets_x] + k*[targets_u], dim=0)
 
         l = np.random.beta(args.alpha, args.alpha)
 
@@ -254,9 +265,7 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
         mixed_input = list(torch.split(mixed_input, batch_size))
         mixed_input = interleave(mixed_input, batch_size)
 
-        logits = [model(mixed_input[0])]
-        for input in mixed_input[1:]:
-            logits.append(model(input))
+        logits = [model(input) for input in mixed_input]
 
         # put interleaved samples back
         logits = interleave(logits, batch_size)

@@ -1,5 +1,4 @@
 import numpy as np
-from PIL import Image
 
 import torchvision
 import torch
@@ -92,7 +91,7 @@ class RandomPadandCrop(object):
         return x
 
 class RandomFlip(object):
-    """Flip randomly the image.
+    """Flip horizontally and randomly the image.
     """
     def __call__(self, x):
         if np.random.rand() < 0.5:
