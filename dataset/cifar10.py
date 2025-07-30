@@ -3,24 +3,23 @@ import numpy as np
 import torchvision
 import torch
 
-class TransformTwice:
-    def __init__(self, transform):
+class TransformK:
+    def __init__(self, transform, k):
         self.transform = transform
+        self.k = k
 
     def __call__(self, inp):
-        out1 = self.transform(inp)
-        out2 = self.transform(inp)
-        return out1, out2
+        return tuple(self.transform(inp) for _ in range(self.k))
 
 def get_cifar10(root, n_labeled,
                  transform_train=None, transform_val=None,
-                 download=True):
+                 download=True, k=2):
 
     base_dataset = torchvision.datasets.CIFAR10(root, train=True, download=download)
     train_labeled_idxs, train_unlabeled_idxs, val_idxs = train_val_split(base_dataset.targets, int(n_labeled/10))
 
     train_labeled_dataset = CIFAR10_labeled(root, train_labeled_idxs, train=True, transform=transform_train)
-    train_unlabeled_dataset = CIFAR10_unlabeled(root, train_unlabeled_idxs, train=True, transform=TransformTwice(transform_train))
+    train_unlabeled_dataset = CIFAR10_unlabeled(root, train_unlabeled_idxs, train=True, transform=TransformK(transform_train, k))
     val_dataset = CIFAR10_labeled(root, val_idxs, train=True, transform=transform_val, download=True)
     test_dataset = CIFAR10_labeled(root, train=False, transform=transform_val, download=True)
 
