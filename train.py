@@ -6,6 +6,7 @@ import shutil
 import time
 import datetime
 import random
+import json
 
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ import torch.optim as optim
 import torch.utils.data as data
 import torchvision.transforms as transforms
 import torch.nn.functional as F
+from torch.utils.data import Subset
 
 import models.wideresnet as models
 import dataset.cifar10 as dataset
@@ -32,11 +34,15 @@ parser.add_argument('--batch-size', default=64, type=int, metavar='N',
                     help='train batchsize')
 parser.add_argument('--lr', '--learning-rate', default=0.002, type=float,
                     metavar='LR', help='initial learning rate')
+parser.add_argument('--fair', default=1, type=int, metavar='1/0',
+                    help='fairness of num. of label per class')
 # Checkpoints
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 # Miscs
 parser.add_argument('--manualSeed', type=int, default=0, help='manual seed')
+parser.add_argument('--log-class', type=int, default=0, help='log loss and acc. for each class')
+
 #Device options
 parser.add_argument('--gpu', default='0', type=str,
                     help='id(s) for CUDA_VISIBLE_DEVICES')
@@ -54,6 +60,7 @@ parser.add_argument('--lambda-u', default=75, type=float)
 parser.add_argument('--T', default=0.5, type=float)
 parser.add_argument('--K', default=2, type=int)
 parser.add_argument('--ema-decay', default=0.999, type=float)
+
 
 
 args = parser.parse_args()
@@ -89,11 +96,13 @@ def main():
         dataset.ToTensor(),
     ])
 
-    train_labeled_set, train_unlabeled_set, val_set, test_set = dataset.get_cifar10(args.dataset_root, args.n_labeled, transform_train=transform_train, transform_val=transform_val, k=args.K)
+    train_labeled_set, train_unlabeled_set, val_set, test_set = dataset.get_cifar10(args.dataset_root, args.n_labeled, transform_train=transform_train, transform_val=transform_val, k=args.K, fair=args.fair)
     labeled_trainloader = data.DataLoader(train_labeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     unlabeled_trainloader = data.DataLoader(train_unlabeled_set, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
     val_loader = data.DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
     test_loader = data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    label_distribution = np.bincount(train_labeled_set.targets)
+    print(f"Label distribution: {label_distribution}")
 
     # Model
     print("==> creating WRN-28-2")
@@ -113,7 +122,6 @@ def main():
 
     cudnn.benchmark = True
     print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters())/1000000.0))
-
     train_criterion = SemiLoss()
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -137,7 +145,10 @@ def main():
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title, resume=True)
     else:
         logger = Logger(os.path.join(args.out, 'log.txt'), title=title)
-        logger.set_names(['Train Loss', 'Train Loss X', 'Train Loss U',  'Valid Loss', 'Valid Acc.', 'Test Loss', 'Test Acc.'])
+        logger.set_names(['Train Loss', 'Train Loss X', 'Train Loss U',  'Valid Loss', 'Valid Acc.', 'Test Loss', 'Test Acc.']
+                         + ([f'Class {i} Loss' for i in range(10)] if args.log_class else [])
+                         + ([f'Class {i} Acc.' for i in range(10)] if args.log_class else [])
+                         )
 
     writer = SummaryWriter(args.out)
     step = 0
@@ -152,7 +163,21 @@ def main():
         train_loss, train_loss_x, train_loss_u = train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, train_criterion, epoch, use_cuda, args.K)
         _, train_acc = validate(labeled_trainloader, ema_model, criterion, epoch, use_cuda, mode='Train Stats')
         val_loss, val_acc = validate(val_loader, ema_model, criterion, epoch, use_cuda, mode='Valid Stats')
-        test_loss, test_acc = validate(test_loader, ema_model, criterion, epoch, use_cuda, mode='Test Stats ')
+        test_loss, test_acc = validate(test_loader, ema_model, criterion, epoch, use_cuda, mode='Test Stats')
+
+        classes_loss = []
+        classes_acc = []
+        if args.log_class:
+            for i in range(10):
+                t = test_set.targets
+                loss, acc = validate(
+                    data.DataLoader(
+                        Subset(test_set, np.where(np.array(test_set.targets) == i)[0]),
+                            batch_size=args.batch_size, shuffle=False, num_workers=0),
+                    ema_model, criterion, epoch, use_cuda, mode=f'Test Class {i} Stats'
+                )
+                classes_loss.append(loss)
+                classes_acc.append(acc)
 
         step = args.train_iteration * (epoch + 1)
 
@@ -165,7 +190,10 @@ def main():
         writer.add_scalar('accuracy/test_acc', test_acc, step)
 
         # append logger file
-        logger.append([train_loss, train_loss_x, train_loss_u, val_loss, val_acc, test_loss, test_acc])
+        logger.append([train_loss, train_loss_x, train_loss_u, val_loss, val_acc, test_loss, test_acc]
+                      + classes_loss
+                      + classes_acc
+                      )
 
         # save model
         is_best = val_acc > best_acc
@@ -182,14 +210,26 @@ def main():
     logger.close()
     writer.close()
 
+    training_time = str(datetime.timedelta(seconds=(time.time() - start)))
+    mean_acc = np.mean(test_accs[-20:])
+
+    dic = vars(args)
+    dic['training_time'] = training_time
+    dic['best_acc'] = best_acc
+    dic['mean_acc'] = mean_acc
+    dic['label_distribution'] = { i : int(label_distribution[i]) for i in range(10) }
+
+    with open(os.path.join(args.out, f'model-{args.start_epoch}.json'), 'w') as f:
+        json.dump(vars(args), f, indent=4)
+
     print('Best acc:')
     print(best_acc)
 
     print('Mean acc:')
-    print(np.mean(test_accs[-20:]))
+    print(mean_acc)
 
     print('total time:')
-    print(datetime.timedelta(seconds=(time.time() - start)))
+    print(training_time)
 
 
 def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, criterion, epoch, use_cuda, k):
@@ -320,6 +360,7 @@ def validate(valloader, model, criterion, epoch, use_cuda, mode):
 
     # switch to evaluate mode
     model.eval()
+    print('in', len(valloader))
 
     end = time.time()
     bar = Bar(f'{mode}', max=len(valloader))

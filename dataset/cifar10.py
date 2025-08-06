@@ -2,6 +2,8 @@ import numpy as np
 
 import torchvision
 import torch
+from matplotlib.pyplot import pause
+
 
 class TransformK:
     def __init__(self, transform, k):
@@ -13,21 +15,29 @@ class TransformK:
 
 def get_cifar10(root, n_labeled,
                  transform_train=None, transform_val=None,
-                 download=True, k=2):
+                 download=True, k=2, fair=True):
 
     base_dataset = torchvision.datasets.CIFAR10(root, train=True, download=download)
-    train_labeled_idxs, train_unlabeled_idxs, val_idxs = train_val_split(base_dataset.targets, int(n_labeled/10))
-
+    if fair:
+        n_labeled_per_class = n_labeled // 10
+        split_size = [n_labeled_per_class for i in range(10)]
+    else:
+        # split_size = random_split(n_labeled)
+        split_size = [
+            25,25,25,25,25,
+            25,25,250,25,25
+        ]
+    train_labeled_idxs, train_unlabeled_idxs, val_idxs = train_val_split(base_dataset.targets, split_size)
     train_labeled_dataset = CIFAR10_labeled(root, train_labeled_idxs, train=True, transform=transform_train)
     train_unlabeled_dataset = CIFAR10_unlabeled(root, train_unlabeled_idxs, train=True, transform=TransformK(transform_train, k))
     val_dataset = CIFAR10_labeled(root, val_idxs, train=True, transform=transform_val, download=True)
     test_dataset = CIFAR10_labeled(root, train=False, transform=transform_val, download=True)
 
     print (f"#Labeled: {len(train_labeled_idxs)} #Unlabeled: {len(train_unlabeled_idxs)} #Val: {len(val_idxs)}")
+
     return train_labeled_dataset, train_unlabeled_dataset, val_dataset, test_dataset
     
-
-def train_val_split(labels, n_labeled_per_class):
+def train_val_split(labels, split_size):
     labels = np.array(labels)
     train_labeled_idxs = []
     train_unlabeled_idxs = []
@@ -36,14 +46,23 @@ def train_val_split(labels, n_labeled_per_class):
     for i in range(10):
         idxs = np.where(labels == i)[0]
         np.random.shuffle(idxs)
-        train_labeled_idxs.extend(idxs[:n_labeled_per_class])
-        train_unlabeled_idxs.extend(idxs[n_labeled_per_class:-500])
+
+        each_size = split_size[i]
+        train_labeled_idxs.extend(idxs[:each_size])
+        train_unlabeled_idxs.extend(idxs[each_size:-500])
         val_idxs.extend(idxs[-500:])
+
     np.random.shuffle(train_labeled_idxs)
     np.random.shuffle(train_unlabeled_idxs)
     np.random.shuffle(val_idxs)
 
     return train_labeled_idxs, train_unlabeled_idxs, val_idxs
+
+def random_split(n_labels):
+    split_point = sorted(np.random.choice(np.arange(n_labels), 10 - 1))
+    split_point.insert(0, 0)
+    split_point.append(n_labels)
+    return [split_point[i + 1] - split_point[i] for i in range(10)]
 
 cifar10_mean = (0.4914, 0.4822, 0.4465) # equals np.mean(train_set.train_data, axis=(0,1,2))/255
 cifar10_std = (0.2471, 0.2435, 0.2616) # equals np.std(train_set.train_data, axis=(0,1,2))/255
